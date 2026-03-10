@@ -1,0 +1,7 @@
+services:
+  exporter:
+    build: .
+    env_file:
+      - .env
+    volumes:
+      - ./export:/export
