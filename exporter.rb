@@ -9,11 +9,16 @@ require "uri"
 require "fileutils"
 require "optparse"
 require "time"
+require "digest"
+require "open-uri"
 
 BASE_URL = "https://api.app.shortcut.com/api/v3"
+MEDIA_HOST = "media.app.shortcut.com"
 OUTPUT_DIR = ENV.fetch("OUTPUT_DIR", "/export")
 
 class ShortcutClient
+  attr_reader :token
+
   def initialize(token)
     @token = token
     @request_count = 0
@@ -99,8 +104,9 @@ class MarkdownExporter
     write_epic(epic)
 
     puts "Fetching stories for epic ##{epic_id}..."
-    stories = @client.get("/epics/#{epic_id}/stories")
-    if stories
+    stories_slim = @client.get("/epics/#{epic_id}/stories")
+    if stories_slim
+      stories = fetch_full_stories(stories_slim)
       stories.each { |story| write_story(story) }
       export_files_from_stories(stories)
       puts "Exported #{stories.size} stories from epic '#{epic["name"]}'."
@@ -139,7 +145,8 @@ class MarkdownExporter
       break unless next_token
     end
 
-    puts "Found #{all_stories.size} stories for team '#{group["name"]}'."
+    puts "Found #{all_stories.size} stories for team '#{group["name"]}'. Fetching full details..."
+    all_stories = fetch_full_stories(all_stories)
     all_stories.each { |story| write_story(story) }
     export_files_from_stories(all_stories)
 
@@ -179,6 +186,13 @@ class MarkdownExporter
 
   private
 
+  def fetch_full_stories(stories_slim)
+    stories_slim.filter_map.with_index do |slim, i|
+      puts "  Fetching story #{i + 1}/#{stories_slim.size}: ##{slim["id"]}..."
+      @client.get("/stories/#{slim["id"]}")
+    end
+  end
+
   def export_all_epics
     puts "Fetching all epics..."
     epics = @client.get("/epics", { "includes_description" => "true" })
@@ -210,7 +224,8 @@ class MarkdownExporter
       break unless next_token
     end
 
-    puts "Found #{all_stories.size} stories."
+    puts "Found #{all_stories.size} stories. Fetching full details..."
+    all_stories = fetch_full_stories(all_stories)
     all_stories.each { |story| write_story(story) }
   end
 
@@ -277,6 +292,7 @@ class MarkdownExporter
       | Points Done | #{epic.dig("stats", "num_points_done")} |
     MD
 
+    content = download_and_replace_images(content, path)
     File.write(path, content)
     puts "  Wrote epic: #{path}"
   end
@@ -304,7 +320,8 @@ class MarkdownExporter
       lines << "---\n\n"
     end
 
-    File.write(path, lines.join)
+    joined = download_and_replace_images(lines.join, path)
+    File.write(path, joined)
     puts "  Wrote epic comments: #{path}"
   end
 
@@ -372,6 +389,7 @@ class MarkdownExporter
       end
     end
 
+    content = download_and_replace_images(content, path)
     File.write(path, content)
     puts "  Wrote story: #{path}"
   end
@@ -401,6 +419,7 @@ class MarkdownExporter
       #{body}
     MD
 
+    content = download_and_replace_images(content, path)
     File.write(path, content)
     puts "  Wrote document: #{path}"
   end
@@ -480,6 +499,88 @@ class MarkdownExporter
         @workflows_cache[state["id"]] = state["name"]
       end
     end
+  end
+
+  def download_and_replace_images(content, md_file_path)
+    images_dir = File.join(@output_dir, "images")
+    FileUtils.mkdir_p(images_dir)
+
+    content.gsub(/!\[([^\]]*)\]\((https?:\/\/#{Regexp.escape(MEDIA_HOST)}[^\)]+)\)/) do
+      alt_text = $1
+      url = $2
+
+      local_name = download_image(url, images_dir)
+      if local_name
+        relative_path = relative_image_path(md_file_path, File.join(images_dir, local_name))
+        "![#{alt_text}](#{relative_path})"
+      else
+        $&
+      end
+    end
+  end
+
+  def download_image(url, images_dir)
+    uri = URI(url)
+    ext = File.extname(uri.path).downcase
+    ext = ".png" if ext.empty?
+    hash = Digest::SHA256.hexdigest(url)[0..11]
+    basename = File.basename(uri.path, File.extname(uri.path))
+    basename = sanitize_filename(basename)
+    basename = "image" if basename.empty?
+    local_name = "#{basename}-#{hash}#{ext}"
+    local_path = File.join(images_dir, local_name)
+
+    return local_name if File.exist?(local_path)
+
+    puts "    Downloading image: #{File.basename(uri.path)}..."
+    fetch_binary(uri, local_path)
+  rescue StandardError => e
+    warn "    Error downloading image: #{e.message}"
+    nil
+  end
+
+  def fetch_binary(uri, local_path, redirect_limit = 5)
+    return warn("    Too many redirects for: #{uri}") if redirect_limit == 0
+
+    request = Net::HTTP::Get.new(uri)
+    if uri.host&.include?(MEDIA_HOST)
+      request["Shortcut-Token"] = @client.token
+    end
+
+    response = Net::HTTP.start(uri.hostname, uri.port, use_ssl: uri.scheme == "https") do |http|
+      http.request(request)
+    end
+
+    case response.code.to_i
+    when 200
+      File.binwrite(local_path, response.body)
+      File.basename(local_path)
+    when 301, 302, 303, 307, 308
+      redirect_uri = URI(response["location"])
+      fetch_binary(redirect_uri, local_path, redirect_limit - 1)
+    else
+      warn "    Failed to download image (#{response.code}): #{uri}"
+      nil
+    end
+  end
+
+  def relative_image_path(from_file, to_file)
+    from_dir = File.dirname(File.expand_path(from_file))
+    to_abs = File.expand_path(to_file)
+
+    from_parts = from_dir.split("/")
+    to_parts = to_abs.split("/")
+
+    common = 0
+    from_parts.each_with_index do |part, i|
+      break unless to_parts[i] == part
+      common = i + 1
+    end
+
+    ups = from_parts.size - common
+    remaining = to_parts[common..]
+
+    ([".."] * ups + remaining).join("/")
   end
 
   def sanitize_filename(name)
