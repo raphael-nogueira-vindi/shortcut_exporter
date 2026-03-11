@@ -128,21 +128,9 @@ class MarkdownExporter
     puts "Found team '#{group["name"]}' (#{group_id}). Searching stories..."
 
     all_stories = []
-    next_token = nil
-
-    loop do
-      body = { "group_ids" => [group_id], "page_size" => 25 }
-      body["next"] = next_token if next_token
-
-      result = @client.post("/stories/search", body)
-      break unless result
-
-      stories = result["data"] || result
-      all_stories.concat(stories) if stories.is_a?(Array)
-
-      next_token = result["next"]
-      break unless next_token
-    end
+    body = { "group_ids" => [group_id] }
+    result = @client.post("/stories/search", body)
+    all_stories = result if result.is_a?(Array)
 
     puts "Found #{all_stories.size} stories for team '#{group["name"]}'. Fetching full details..."
     all_stories = fetch_full_stories(all_stories)
@@ -207,21 +195,9 @@ class MarkdownExporter
   def export_all_stories
     puts "Fetching all stories..."
     all_stories = []
-    next_token = nil
-
-    loop do
-      body = { "page_size" => 25 }
-      body["next"] = next_token if next_token
-
-      result = @client.post("/stories/search", body)
-      break unless result
-
-      stories = result["data"] || result
-      all_stories.concat(stories) if stories.is_a?(Array)
-
-      next_token = result["next"]
-      break unless next_token
-    end
+    body = {}
+    result = @client.post("/stories/search", body)
+    all_stories = result if result.is_a?(Array)
 
     puts "Found #{all_stories.size} stories. Fetching full details..."
     all_stories = fetch_full_stories(all_stories)
