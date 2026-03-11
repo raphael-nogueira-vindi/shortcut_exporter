@@ -371,13 +371,24 @@ class MarkdownExporter
       end
     end
 
-    comments = story["comments"] || []
-    if comments.any?
+    story_comments = @client.get("/stories/#{story["id"]}/comments") || []
+    if story_comments.any?
       content += "\n## Comments\n\n"
-      comments.sort_by { |c| c["created_at"] || "" }.each do |comment|
+      story_comments.sort_by { |c| c["created_at"] || "" }.each do |comment|
         author = resolve_member(comment["author_id"])
         content += "### #{author} - #{format_date(comment["created_at"])}\n\n"
-        content += "#{comment["text"]}\n\n"
+        content += "#{comment["text"]}\n\n" unless comment["text"].to_s.strip.empty?
+
+        (comment["comments"] || []).sort_by { |r| r["created_at"] || "" }.each do |reply|
+          reply_author = resolve_member(reply["author_id"])
+          content += "> **#{reply_author}** - #{format_date(reply["created_at"])}\n"
+          reply["text"].to_s.strip.each_line do |line|
+            content += "> #{line}"
+          end
+          content += "\n\n"
+        end
+
+        content += "---\n\n"
       end
     end
 
@@ -386,6 +397,21 @@ class MarkdownExporter
       content += "\n## Branches\n\n"
       branches.each do |branch|
         content += "- `#{branch["name"]}`\n"
+      end
+    end
+
+    history = @client.get("/stories/#{story["id"]}/history") || []
+    if history.any?
+      content += "\n## Activity\n\n"
+      history.sort_by { |h| h["changed_at"] || "" }.each do |entry|
+        actor = entry["actor_name"] || resolve_member(entry["member_id"])
+        content += "**#{actor}** - #{format_date(entry["changed_at"])}\n\n"
+
+        (entry["actions"] || []).each do |action|
+          content += format_history_action(action, entry["references"] || [])
+        end
+
+        content += "\n---\n\n"
       end
     end
 
@@ -488,6 +514,135 @@ class MarkdownExporter
     end
 
     @epic_states_cache[state_id] || state_id.to_s
+  end
+
+  def format_history_action(action, references)
+    ref_map = {}
+    references.each { |r| ref_map[r["id"]] = r["name"] || r["url"] || r["id"].to_s }
+
+    entity = action["entity_type"] || "item"
+    act = action["action"] || "update"
+
+    case "#{entity}-#{act}"
+    when "story-create"
+      "- Created story **#{action["name"]}**\n"
+    when "story-update"
+      format_story_changes(action["changes"] || {}, ref_map)
+    when "story-delete"
+      "- Deleted story **#{action["name"]}**\n"
+    when "story-comment-create"
+      "- Added a comment\n"
+    when "task-create"
+      "- Added task: #{action["description"] || action["name"] || "task"}\n"
+    when "task-update"
+      changes = action["changes"] || {}
+      if changes["complete"]
+        new_val = changes["complete"]["new"]
+        "- #{new_val ? "Completed" : "Reopened"} task: #{action["description"] || action["name"] || "task"}\n"
+      else
+        "- Updated task: #{action["description"] || action["name"] || "task"}\n"
+      end
+    when "task-delete"
+      "- Removed task: #{action["description"] || action["name"] || "task"}\n"
+    when "branch-create"
+      "- Created branch: `#{ref_map[action["id"]] || action["name"] || action["id"]}`\n"
+    when "branch-merge"
+      "- Merged branch: `#{ref_map[action["id"]] || action["name"] || action["id"]}`\n"
+    when "branch-push"
+      "- Pushed to branch: `#{ref_map[action["id"]] || action["name"] || action["id"]}`\n"
+    when "pull-request-create", "pull-request-update", "pull-request-close", "pull-request-reopen"
+      "- Pull request #{act}: #{action["name"] || action["url"] || ""}\n"
+    when "story-link-create"
+      "- Linked story\n"
+    when "story-link-delete"
+      "- Unlinked story\n"
+    when "label-create"
+      "- Added label: #{ref_map[action["id"]] || action["name"] || ""}\n"
+    when "label-delete"
+      "- Removed label: #{ref_map[action["id"]] || action["name"] || ""}\n"
+    else
+      "- #{act.capitalize} #{entity.tr("-", " ")}\n"
+    end
+  end
+
+  def format_story_changes(changes, ref_map)
+    lines = ""
+
+    if changes["workflow_state_id"]
+      old_state = ref_map[changes["workflow_state_id"]["old"]] || resolve_workflow_state(changes["workflow_state_id"]["old"])
+      new_state = ref_map[changes["workflow_state_id"]["new"]] || resolve_workflow_state(changes["workflow_state_id"]["new"])
+      lines += "- State: **#{old_state}** → **#{new_state}**\n"
+    end
+
+    if changes["owner_ids"]
+      added = (changes["owner_ids"]["adds"] || []).map { |id| resolve_member(id) }
+      removed = (changes["owner_ids"]["removes"] || []).map { |id| resolve_member(id) }
+      lines += "- Added owners: #{added.join(", ")}\n" if added.any?
+      lines += "- Removed owners: #{removed.join(", ")}\n" if removed.any?
+    end
+
+    if changes["epic_id"]
+      old_epic = changes["epic_id"]["old"] ? (ref_map[changes["epic_id"]["old"]] || "##{changes["epic_id"]["old"]}") : "none"
+      new_epic = changes["epic_id"]["new"] ? (ref_map[changes["epic_id"]["new"]] || "##{changes["epic_id"]["new"]}") : "none"
+      lines += "- Epic: #{old_epic} → #{new_epic}\n"
+    end
+
+    if changes["estimate"]
+      old_est = changes["estimate"]["old"] || "none"
+      new_est = changes["estimate"]["new"] || "none"
+      lines += "- Estimate: #{old_est} → #{new_est}\n"
+    end
+
+    if changes["label_ids"]
+      added = (changes["label_ids"]["adds"] || []).map { |id| ref_map[id] || id.to_s }
+      removed = (changes["label_ids"]["removes"] || []).map { |id| ref_map[id] || id.to_s }
+      lines += "- Added labels: #{added.join(", ")}\n" if added.any?
+      lines += "- Removed labels: #{removed.join(", ")}\n" if removed.any?
+    end
+
+    if changes["name"]
+      lines += "- Renamed: \"#{changes["name"]["old"]}\" → \"#{changes["name"]["new"]}\"\n"
+    end
+
+    if changes["description"]
+      lines += "- Updated description\n"
+    end
+
+    if changes["story_type"]
+      lines += "- Type: #{changes["story_type"]["old"]} → #{changes["story_type"]["new"]}\n"
+    end
+
+    if changes["deadline"]
+      old_dl = changes["deadline"]["old"] ? format_date(changes["deadline"]["old"]) : "none"
+      new_dl = changes["deadline"]["new"] ? format_date(changes["deadline"]["new"]) : "none"
+      lines += "- Deadline: #{old_dl} → #{new_dl}\n"
+    end
+
+    if changes["iteration_id"]
+      old_iter = changes["iteration_id"]["old"] ? (ref_map[changes["iteration_id"]["old"]] || "##{changes["iteration_id"]["old"]}") : "none"
+      new_iter = changes["iteration_id"]["new"] ? (ref_map[changes["iteration_id"]["new"]] || "##{changes["iteration_id"]["new"]}") : "none"
+      lines += "- Iteration: #{old_iter} → #{new_iter}\n"
+    end
+
+    if changes["group_id"]
+      old_grp = changes["group_id"]["old"] ? (ref_map[changes["group_id"]["old"]] || changes["group_id"]["old"]) : "none"
+      new_grp = changes["group_id"]["new"] ? (ref_map[changes["group_id"]["new"]] || changes["group_id"]["new"]) : "none"
+      lines += "- Team: #{old_grp} → #{new_grp}\n"
+    end
+
+    if changes["follower_ids"]
+      added = (changes["follower_ids"]["adds"] || []).map { |id| resolve_member(id) }
+      removed = (changes["follower_ids"]["removes"] || []).map { |id| resolve_member(id) }
+      lines += "- Added followers: #{added.join(", ")}\n" if added.any?
+      lines += "- Removed followers: #{removed.join(", ")}\n" if removed.any?
+    end
+
+    if changes["archived"]
+      lines += "- #{changes["archived"]["new"] ? "Archived" : "Unarchived"}\n"
+    end
+
+    lines += "- Updated story\n" if lines.empty?
+    lines
   end
 
   def load_workflows
