@@ -101,16 +101,15 @@ class MarkdownExporter
     epic = @client.get("/epics/#{epic_id}")
     return warn("Epic ##{epic_id} not found.") unless epic
 
-    write_epic(epic)
-
     puts "Fetching stories for epic ##{epic_id}..."
-    stories_slim = @client.get("/epics/#{epic_id}/stories")
-    if stories_slim
-      stories = fetch_full_stories(stories_slim)
-      stories.each { |story| write_story(story) }
-      export_files_from_stories(stories)
-      puts "Exported #{stories.size} stories from epic '#{epic["name"]}'."
-    end
+    stories_slim = @client.get("/epics/#{epic_id}/stories") || []
+    stories = fetch_full_stories(stories_slim)
+
+    write_epic(epic, stories)
+
+    stories.each { |story| write_story(story) }
+    export_files_from_stories(stories)
+    puts "Exported #{stories.size} stories from epic '#{epic["name"]}'."
 
     puts "Fetching comments for epic ##{epic_id}..."
     comments = @client.get("/epics/#{epic_id}/comments")
@@ -249,7 +248,7 @@ class MarkdownExporter
     end
   end
 
-  def write_epic(epic)
+  def write_epic(epic, stories = nil)
     dir = File.join(@output_dir, "epics")
     FileUtils.mkdir_p(dir)
 
@@ -291,6 +290,21 @@ class MarkdownExporter
       | Total Points | #{epic.dig("stats", "num_points")} |
       | Points Done | #{epic.dig("stats", "num_points_done")} |
     MD
+
+    stories ||= @client.get("/epics/#{epic["id"]}/stories") || []
+
+    if stories.any?
+      content += "\n## Stories\n\n"
+      content += "| ID | Name | Type | State | Owners |\n"
+      content += "|----|------|------|-------|--------|\n"
+      stories.each do |story|
+        s_state = resolve_workflow_state(story["workflow_state_id"])
+        s_owners = (story["owner_ids"] || []).map { |id| resolve_member(id) }.join(", ")
+        s_type = story["story_type"] || "—"
+        story_file = sanitize_filename("#{story["id"]}-#{story["name"]}")
+        content += "| #{story["id"]} | [#{story["name"]}](../stories/#{story_file}.md) | #{s_type} | #{s_state} | #{s_owners} |\n"
+      end
+    end
 
     content = download_and_replace_images(content, path)
     File.write(path, content)
